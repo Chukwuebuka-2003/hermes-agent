@@ -8063,6 +8063,8 @@ class AIAgent:
         relay_turn = None
         token = None
         acct_token = None
+        exec_id = None
+        exec_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -8101,6 +8103,24 @@ class AIAgent:
                 getattr(self, "_session_db", None),
                 getattr(self, "session_id", None),
             )
+            # Per-conversation execution record (issue #102190): one
+            # ``running`` row per run_conversation, finalized below. The
+            # published ContextVar lets queue_token_counts /
+            # record_auxiliary_usage attribute canonical deltas by actual
+            # (model, task). Fail-open: a sidecar fault must never break
+            # the turn.
+            try:
+                from agent.execution_record import (
+                    set_current_execution,
+                    start_execution,
+                )
+
+                exec_id = start_execution(session_id, correlation_id=relay_turn_id)
+                if exec_id:
+                    exec_token = set_current_execution(exec_id, session_id)
+            except Exception:
+                exec_id = None
+                exec_token = None
             from agent.auxiliary_client import scoped_runtime_main
 
             # The outer token restores the caller's Context even though turn setup
@@ -8128,6 +8148,18 @@ class AIAgent:
                 relay_outcome = "failed"
             else:
                 relay_outcome = "success"
+            try:
+                from agent.execution_record import derive_status, finish_execution
+
+                finish_execution(
+                    exec_id,
+                    derive_status(
+                        interrupted=terminal.get("interrupted") is True,
+                        failed=terminal.get("failed") is True,
+                    ),
+                )
+            except Exception:
+                pass
             relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
                 relay_turn,
                 outcome=relay_outcome,
@@ -8143,6 +8175,20 @@ class AIAgent:
                 relay_outcome = "cancelled"
             elif isinstance(exc, TimeoutError):
                 relay_outcome = "timed_out"
+            # Terminal execution status on raise (issue #102190): cancelled
+            # for interrupts, failed otherwise. A dead process simply never
+            # reaches here and its row stays ``running``. Fail-open.
+            try:
+                from agent.execution_record import finish_execution
+
+                if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
+                    type(exc).__name__ == "CancelledError"
+                ):
+                    finish_execution(exec_id, "cancelled")
+                else:
+                    finish_execution(exec_id, "failed")
+            except Exception:
+                pass
             if relay_turn is not None:
                 relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
                     relay_turn,
@@ -8176,6 +8222,12 @@ class AIAgent:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    try:
+                        from agent.execution_record import reset_current_execution
+
+                        reset_current_execution(exec_token)
+                    except Exception:
+                        pass
                     if token is not None:
                         reset_conversation_context(token)
 

@@ -6281,6 +6281,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     thread.start()
                     atexit.register(self._drain_token_queue_at_exit)
                 self._token_queue_cond.notify_all()
+        if not writer_stopped:
+            # Mirror the canonical delta into the per-conversation execution
+            # sidecar (issue #102190). Queue-time capture is the single
+            # source: the background writer / flush drains apply the same
+            # delta to state.db without touching the sidecar (they carry no
+            # execution ContextVar), so no double-count is possible.
+            # Absolute overwrites are skipped by note_queued_delta. Fail-open.
+            try:
+                from agent.execution_record import note_queued_delta
+
+                note_queued_delta(session_id, kwargs)
+            except Exception:
+                pass
         if writer_stopped:
             # Writer permanently stopped (close() ran; a stop-flagged but
             # still-live writer keeps accepting — its loop drains before
@@ -6289,6 +6302,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # hook. Apply inline instead so a closed-connection failure
             # raises at the call site, exactly like the old synchronous
             # update_token_counts path these call sites still guard for.
+            # Mirror into the execution sidecar first (issue #102190):
+            # update_token_counts itself never touches the sidecar, so the
+            # queue-time record is the single source — no double-count with
+            # background/flush applies. Fail-open.
+            try:
+                from agent.execution_record import note_queued_delta
+
+                note_queued_delta(session_id, kwargs)
+            except Exception:
+                pass
             self.update_token_counts(session_id, **kwargs)
 
     def flush_token_counts(self, timeout: float = 5.0) -> bool:
@@ -6817,6 +6840,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 task=task,
             )
         self._execute_write(_do)
+        # Mirror into the per-conversation execution sidecar (issue #102190)
+        # so auxiliary calls attribute by actual (model, task). Recorded only
+        # after the official write succeeds to preserve conservation.
+        # Fail-open: never break the aux call.
+        try:
+            from agent.execution_record import note_canonical_delta
+
+            note_canonical_delta(
+                session_id,
+                model=model,
+                task=task,
+                api_call_count=1,
+                input_tokens=input_tokens or 0,
+                output_tokens=output_tokens or 0,
+                reasoning_tokens=reasoning_tokens or 0,
+                cache_read_tokens=cache_read_tokens or 0,
+                cache_write_tokens=cache_write_tokens or 0,
+                estimated_cost_usd=estimated_cost_usd,
+                actual_cost_usd=None,
+            )
+        except Exception:
+            pass
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
