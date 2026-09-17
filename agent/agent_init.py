@@ -865,13 +865,27 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
         # Explicit non-OpenRouter provider with no creds and no usable fallback: fail fast.
-        # Use the provider's real env var name (alibaba → DASHSCOPE_API_KEY).
+        # Use the provider's real env var name(s) (alibaba-coding-plan →
+        # ALIBABA_CODING_PLAN_API_KEY, DASHSCOPE_API_KEY); naive
+        # ``_explicit.upper()`` yields invalid hints for hyphenated IDs
+        # (opencode-zen → OPENCODE-ZEN_API_KEY). OAuth providers register no
+        # ``api_key_env_vars`` — point at the login flow instead.
         _env_hint = f"{_explicit.upper()}_API_KEY"
+        _is_oauth = False
         with suppress(Exception):
             from hermes_cli.auth import PROVIDER_REGISTRY
             _pcfg = PROVIDER_REGISTRY.get(_explicit)
             if _pcfg and _pcfg.api_key_env_vars:
-                _env_hint = _pcfg.api_key_env_vars[0]
+                _env_hint = ", ".join(_pcfg.api_key_env_vars)
+            elif _pcfg and str(getattr(_pcfg, "auth_type", "")).startswith("oauth"):
+                _is_oauth = True
+                _env_hint = ""
+        if _is_oauth and not _env_hint:
+            raise RuntimeError(
+                f"Provider '{_explicit}' is set in config.yaml but no credentials "
+                f"were found. Run `hermes auth add {_explicit}` to sign in, "
+                f"or switch to a different provider with `hermes model`."
+            )
         raise RuntimeError(
             f"Provider '{_explicit}' is set in config.yaml but no API key "
             f"was found. Set the {_env_hint} environment "

@@ -7061,10 +7061,37 @@ def _resolve_call_client(
                     task, _explicit)
                 if fb_client is None:
                     nous_detail = nous_credential_failure_detail() if _explicit == "nous" else None
-                    raise AuxiliaryClientUnavailable(nous_detail or (
-                        f"Provider '{_explicit}' is set in config.yaml but no API key was found. "
-                        f"Set the {_explicit.upper()}_API_KEY environment variable, or switch to "
-                        f"a different provider with `hermes model`."))
+                    if nous_detail is None:
+                        # Use the provider's real env var name(s): naive
+                        # ``_explicit.upper()`` yields invalid hints for hyphenated IDs
+                        # (minimax-oauth → MINIMAX-OAUTH_API_KEY, opencode-zen →
+                        # OPENCODE-ZEN_API_KEY). OAuth providers register no
+                        # ``api_key_env_vars`` — point at the login flow instead.
+                        _env_hint: Optional[str] = None
+                        _is_oauth = False
+                        with contextlib.suppress(Exception):
+                            from hermes_cli.auth import PROVIDER_REGISTRY
+                            _pcfg = PROVIDER_REGISTRY.get(_explicit)
+                            if _pcfg and _pcfg.api_key_env_vars:
+                                _env_hint = ", ".join(_pcfg.api_key_env_vars)
+                            elif _pcfg and str(getattr(_pcfg, "auth_type", "")).startswith("oauth"):
+                                _is_oauth = True
+                        if _env_hint:
+                            nous_detail = (
+                                f"Provider '{_explicit}' is set in config.yaml but no API key was found. "
+                                f"Set the {_env_hint} environment variable, or switch to "
+                                f"a different provider with `hermes model`.")
+                        elif _is_oauth:
+                            nous_detail = (
+                                f"Provider '{_explicit}' is set in config.yaml but no credentials were found. "
+                                f"Run `hermes auth add {_explicit}` to sign in, or switch to "
+                                f"a different provider with `hermes model`.")
+                        else:
+                            nous_detail = (
+                                f"Provider '{_explicit}' is set in config.yaml but no API key was found. "
+                                f"Set the {_explicit.upper()}_API_KEY environment variable, or switch to "
+                                f"a different provider with `hermes model`.")
+                    raise AuxiliaryClientUnavailable(nous_detail)
                 client, final_model = fb_client, fb_model
                 if async_mode:
                     client, final_model = _to_async_client(
