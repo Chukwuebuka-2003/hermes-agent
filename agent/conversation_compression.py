@@ -174,7 +174,8 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_last_summary_fallback_used", "_last_compress_aborted", "_last_summary_auth_failure",
     "_last_summary_network_failure", "_last_summary_empty_content_failure", "_last_summary_truncated_failure",
     "_last_summary_overload_failure",
-    "_last_aux_model_failure_error", "_last_aux_model_failure_model", "_summary_model_fallen_back", "summary_model",
+    "_last_aux_model_failure_error", "_last_aux_model_failure_model", "_last_aux_resolved_model",
+    "_summary_model_fallen_back", "summary_model",
     "_last_compression_telemetry", "_active_compression_telemetry", "_compression_telemetry_seed",
     "_proactive_prune_rearm_tokens",
 )
@@ -614,6 +615,13 @@ class CompressionCommitFence:
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
 
+# An over-window request cannot be sent uncompressed, so its summary wait is capped well below the
+# generic ceiling: the deterministic fallback summary (no summary LLM) carries the compaction instead
+# of a slow/trickling summary holding the host toward the full ceiling while reclaiming nothing
+# (#116472: a 600s stall froze the Desktop UI). Applied as ``min(idle, this)`` so a configured
+# ``compression.context_timeout_seconds`` below this value still wins.
+_OVER_WINDOW_COMPRESSION_CEILING_SECONDS = 120.0
+
 # Unlike explicit_interrupt, a /stop after the stall window arms the durable backoff (no automatic re-entry).
 # Distinct from ``explicit_interrupt``: a /stop that arrived after the summary stream had already crossed
 # the no-progress stall window (#96775). Ordinary early /stop stays cooldown-neutral; this class arms the
@@ -888,6 +896,7 @@ def _retry_compression_on_fallback_chain(
     on_commit_overrun: Optional[Callable[[float, float], None]] = None,
     on_timeout_cause: Optional[Callable[[bool, bool], None]] = None, telemetry_agent: Any = None,
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None, escalate_deterministic: bool = False,
+    request_exceeds_window: bool = False,
 ) -> Optional[Tuple[list, str]]:
     """Re-run an aborted compression with the summary route pinned: once on the configured chain entry,
     then — when ``escalate_deterministic`` (a stall backoff already burned one idle window this session,
@@ -915,7 +924,7 @@ def _retry_compression_on_fallback_chain(
             route, worker=worker, messages=messages, system_prompt_fallback=system_prompt_fallback,
             idle_timeout_seconds=idle_timeout_seconds, total_ceiling_seconds=total_ceiling_seconds,
             on_commit_overrun=on_commit_overrun, on_timeout_cause=on_timeout_cause, telemetry_agent=telemetry_agent,
-            new_fence=new_fence,
+            new_fence=new_fence, request_exceeds_window=request_exceeds_window,
         )
         if recovered is not None:
             return recovered
@@ -927,6 +936,7 @@ def _run_pinned_compression_retry(
     system_prompt_fallback: Any, idle_timeout_seconds: float, total_ceiling_seconds: float,
     on_commit_overrun: Optional[Callable[[float, float], None]], on_timeout_cause: Optional[Callable[[bool, bool], None]],
     telemetry_agent: Any, new_fence: Optional[Callable[[], CompressionCommitFence]],
+    request_exceeds_window: bool = False,
 ) -> Optional[Tuple[list, str]]:
     """One bounded re-run of ``worker`` with ``route`` pinned; ``None`` when it produced no compression."""
     # The aborted fence refuses all commits; mint a fresh one via the host factory
@@ -969,7 +979,7 @@ def _run_pinned_compression_retry(
                 worker=worker, messages=messages, system_prompt_fallback=system_prompt_fallback,
                 idle_timeout_seconds=idle, total_ceiling_seconds=ceiling, on_commit_overrun=on_commit_overrun,
                 on_timeout_cause=on_timeout_cause, fence=retry_fence, telemetry_agent=telemetry_agent,
-                stall_fallback=False,
+                stall_fallback=False, request_exceeds_window=request_exceeds_window,
             )
     except Exception:
         # The primary already failed; a failing fallback must degrade, never
@@ -1123,6 +1133,14 @@ def run_compress_context_with_progress_timeout(
 
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
+    # An over-window request cannot be sent uncompressed, so a slow/trickling summary must not hold
+    # the host to the full ceiling: bound the total pre-commit wait to the dedicated over-window budget
+    # and let the deterministic fallback summary (no summary LLM) carry the compaction. A stream that
+    # emits a token just under the idle budget otherwise keeps "progress" alive all the way to the
+    # ceiling while reclaiming nothing (#116472: 600s stall → Desktop UI freeze → renderer SIGKILL).
+    # ``min`` keeps a configured ``context_timeout_seconds`` below the budget authoritative.
+    if request_exceeds_window:
+        ceiling = min(idle, _OVER_WINDOW_COMPRESSION_CEILING_SECONDS)
     fence = fence if fence is not None else CompressionCommitFence()
     fence.set_total_ceiling_seconds(ceiling)
     # Read BEFORE this attempt runs: the host's ``stalled`` record and the cancelled worker's
@@ -1230,6 +1248,7 @@ def run_compress_context_with_progress_timeout(
                 idle_timeout_seconds=idle, total_ceiling_seconds=ceiling, on_commit_overrun=on_commit_overrun,
                 on_timeout_cause=on_timeout_cause, telemetry_agent=telemetry_agent, new_fence=new_fence,
                 escalate_deterministic=escalate_deterministic,
+                request_exceeds_window=request_exceeds_window,
             )
             if recovered is not None:
                 return recovered
