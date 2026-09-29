@@ -37,6 +37,11 @@ gateway:
   no_active_goal:   "No active goal."
   config_read_failed: "⚠️ Could not read config.yaml: {error}"
   config_save_failed: "⚠️ Could not save config: {error}"
+  secure_input:
+    received: "Verification code received."
+    cancelled: "Verification code request cancelled."
+    expired: "Verification code request expired."
+    delivery_failed: "Verification code form could not be opened."
 
   # /model command output -- shown after a model switch or when listing models.
   # Provider names, model IDs, capability strings, and cost figures are NOT
@@ -476,3 +481,16 @@ gateway:
     session_db_unavailable_prefix: "Session database not available"
     session_not_found:           "Session not found in database."
     warn_passthrough:            "⚠️ {error}"
+
+platform:
+  slack:
+    secure_input:
+      prompt: "🔐 *{site} needs a verification code.* Open the private form below. Never paste the code into chat."
+      fallback: "Secure verification code requested for {site}"
+      open_button: "Enter code privately"
+      modal_title: "Verification code"
+      input_label: "Code for {site}"
+      submit: "Submit"
+      cancel: "Cancel"
+      expired: "This request expired or belongs to another user. Ask Hermes to try again."
+
