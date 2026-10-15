@@ -68,6 +68,114 @@ class VaultError(Exception):
     """Vault failure that is safe to surface (never contains secret values)."""
 
 
+class EncryptedDocumentStore:
+    """Cross-process locked encrypted JSON document under one profile directory."""
+
+    def __init__(
+        self,
+        base_dir: Path,
+        *,
+        filename: str,
+        key_filename: str,
+        lock_filename: str,
+        label: str,
+    ) -> None:
+        self._base = Path(base_dir)
+        self._document_path = self._base / filename
+        self._key_path = self._base / key_filename
+        self._lock_path = self._base / lock_filename
+        self._label = label
+
+    def _ensure_dir(self) -> None:
+        self._base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            from hermes_cli.config import _secure_dir
+
+            _secure_dir(self._base)
+        except Exception:
+            with suppress(OSError):
+                os.chmod(self._base, 0o700)
+
+    @contextmanager
+    def _locked(self):
+        """Serialize encrypted read-modify-write cycles across threads and processes."""
+        with _LOCK:
+            self._ensure_dir()
+            if msvcrt and (not self._lock_path.exists() or self._lock_path.stat().st_size == 0):
+                self._lock_path.write_text(" ", encoding="utf-8")
+            with open(self._lock_path, "r+" if msvcrt else "a+", encoding="utf-8") as fd:
+                if fcntl:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                elif msvcrt:
+                    fd.seek(0)
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
+                try:
+                    yield
+                finally:
+                    with suppress(OSError):
+                        if fcntl:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        elif msvcrt:
+                            fd.seek(0)
+                            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+
+    def _fernet(self):
+        from cryptography.fernet import Fernet
+
+        self._ensure_dir()
+        if not self._key_path.exists():
+            key = Fernet.generate_key()
+            fd = os.open(self._key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, key)
+            finally:
+                os.close(fd)
+        else:
+            key = self._key_path.read_bytes().strip()
+        with suppress(OSError):
+            os.chmod(self._key_path, 0o600)
+        return Fernet(key)
+
+    def _read_json(self) -> Dict[str, Any]:
+        if not self._document_path.exists():
+            return {}
+        blob = self._document_path.read_bytes()
+        if not blob:
+            return {}
+        from cryptography.fernet import InvalidToken
+
+        try:
+            raw = self._fernet().decrypt(blob)
+        except InvalidToken as exc:
+            raise VaultError(
+                f"{self._label} file could not be decrypted (key mismatch or corruption)"
+            ) from exc
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise VaultError(f"{self._label} file is corrupted (invalid JSON)") from exc
+        if not isinstance(data, dict):
+            raise VaultError(f"{self._label} file is corrupted (unexpected shape)")
+        return data
+
+    def _write_json(self, data: Dict[str, Any]) -> None:
+        payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        blob = self._fernet().encrypt(payload)
+        atomic_write_bytes(self._document_path, blob, mode=0o600, fsync_dir=True)
+
+    @contextmanager
+    def locked_document(self):
+        """Yield the current document and atomically commit it before releasing the lock."""
+        with self._locked():
+            document = self._read_json()
+            yield document
+            self._write_json(document)
+
+    def read_document(self) -> Dict[str, Any]:
+        with self._locked():
+            return self._read_json()
+
+
 _OTP_ALGOS = {"SHA1": "sha1", "SHA256": "sha256", "SHA512": "sha512"}
 
 
@@ -190,114 +298,28 @@ class VaultItemMeta:
         return out
 
 
-class VaultStore:
+class VaultStore(EncryptedDocumentStore):
     """Encrypted, profile-scoped vault under ``<HERMES_HOME>/vault/``."""
 
     def __init__(self, base_dir: Optional[Path] = None):
-        self._base = Path(base_dir) if base_dir is not None else (
-            Path(get_hermes_home()) / "vault"
+        super().__init__(
+            Path(base_dir) if base_dir is not None else Path(get_hermes_home()) / "vault",
+            filename="vault.json.enc",
+            key_filename="vault.key",
+            lock_filename=".vault.lock",
+            label="vault",
         )
-        self._vault_path = self._base / "vault.json.enc"
-        self._key_path = self._base / "vault.key"
-
-    # -- key / crypto ------------------------------------------------------
-
-    def _ensure_dir(self) -> None:
-        self._base.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # Route through the canonical securer (honors managed/NixOS
-        # group-share mode and HERMES_UID/GID ownership) rather than a
-        # bespoke chmod — same requirement as the browser-profile snapshot
-        # dir (f1d05c review).
-        try:
-            from hermes_cli.config import _secure_dir
-
-            _secure_dir(self._base)
-        except Exception:
-            try:
-                os.chmod(self._base, 0o700)
-            except OSError:
-                pass
-
-    @contextmanager
-    def _locked(self):
-        """Serialize read-modify-write cycles across threads AND processes: the Desktop gateway, a CLI
-        `hermes vault add` and a TUI slash worker all write the same ``vault.json.enc``; two unlocked
-        writers would drop each other's items."""
-        with _LOCK:
-            self._ensure_dir()
-            lock_path = self._base / ".vault.lock"
-            if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-                lock_path.write_text(" ", encoding="utf-8")  # msvcrt needs a non-empty byte range to lock
-            with open(lock_path, "r+" if msvcrt else "a+", encoding="utf-8") as fd:
-                if fcntl:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                elif msvcrt:
-                    fd.seek(0)
-                    msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
-                try:
-                    yield
-                finally:
-                    with suppress(OSError):
-                        if fcntl:
-                            fcntl.flock(fd, fcntl.LOCK_UN)
-                        elif msvcrt:
-                            fd.seek(0)
-                            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
-
-    def _fernet(self):
-        from cryptography.fernet import Fernet
-
-        self._ensure_dir()
-        if not self._key_path.exists():
-            key = Fernet.generate_key()
-            fd = os.open(
-                self._key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-            )
-            try:
-                os.write(fd, key)
-            finally:
-                os.close(fd)
-        else:
-            key = self._key_path.read_bytes().strip()
-        try:
-            os.chmod(self._key_path, 0o600)
-        except OSError:
-            pass
-        return Fernet(key)
+        self._vault_path = self._document_path
 
     # -- persistence -------------------------------------------------------
 
     def _read_all(self) -> List[Dict[str, Any]]:
-        if not self._vault_path.exists():
-            return []
-        blob = self._vault_path.read_bytes()
-        if not blob:
-            return []
-        from cryptography.fernet import InvalidToken
-
-        try:
-            raw = self._fernet().decrypt(blob)
-        except InvalidToken as exc:
-            raise VaultError(
-                "vault file could not be decrypted (key mismatch or corruption)"
-            ) from exc
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise VaultError(
-                "vault file is corrupted (invalid JSON)"
-            ) from exc
-        if not isinstance(data, dict):
-            raise VaultError("vault file is corrupted (unexpected shape)")
+        data = self._read_json()
         items = data.get("items", [])
         return items if isinstance(items, list) else []
 
     def _write_all(self, items: List[Dict[str, Any]]) -> None:
-        self._ensure_dir()
-        payload = json.dumps({"version": 1, "items": items}).encode("utf-8")
-        blob = self._fernet().encrypt(payload)
-        # fsync_dir: the directory entry must be durable too (power loss between rename and next sync).
-        atomic_write_bytes(self._vault_path, blob, mode=0o600, fsync_dir=True)
+        self._write_json({"version": 1, "items": items})
 
     # -- public API ----------------------------------------------------------
 

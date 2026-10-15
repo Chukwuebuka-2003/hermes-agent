@@ -357,15 +357,12 @@ def browser_vault_enter_code(
     # Source 0 — trusted retrieval already parked the code; never fall back to
     # prompting the user when a handle was supplied and is dead (#119683).
     if not code and code_handle:
-        from agent.code_registry import consume as consume_code
+        from agent.code_registry import consume_entry
 
-        minted_source = ""
-        from agent.code_registry import peek_source
-
-        minted_source = peek_source(code_handle) or ""
-        code = consume_code(code_handle, origin=origin)
-        if code:
-            source = minted_source or "handle"
+        consumed = consume_entry(code_handle, origin=origin)
+        if consumed:
+            code = consumed["code"]
+            source = consumed["source"] or "handle"
         else:
             return json.dumps({
                 "success": False,

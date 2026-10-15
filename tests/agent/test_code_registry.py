@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -49,9 +52,31 @@ class TestMint:
 
 
 class TestConsume:
-    def test_single_use(self):
+    def test_concurrent_cross_process_consume_has_one_winner(self):
         handle = code_registry.mint("444444")["code_handle"]
-        assert code_registry.consume(handle) == "444444"
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from agent.code_registry import consume; "
+                "print('won' if consume(sys.argv[1]) else 'lost')"
+            ),
+            handle,
+        ]
+        children = [
+            subprocess.Popen(
+                command,
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _ in range(2)
+        ]
+        results = [child.communicate(timeout=10) for child in children]
+        assert [child.returncode for child in children] == [0, 0]
+        assert sorted(stdout.strip() for stdout, _ in results) == ["lost", "won"]
         assert code_registry.consume(handle) is None
 
     def test_unknown_handle(self):
@@ -60,10 +85,8 @@ class TestConsume:
 
     def test_expired_handle(self, monkeypatch):
         handle = code_registry.mint("555555")["code_handle"]
-        # force expiry
-        with code_registry._LOCK:
-            bucket = code_registry._REGISTRY[code_registry._scope()]
-            bucket[handle]["expires_at"] = time.time() - 1
+        now = time.time()
+        monkeypatch.setattr(code_registry.time, "time", lambda: now + 1_000)
         assert code_registry.consume(handle) is None
         # expired entry was still dropped
         assert code_registry.consume(handle) is None
@@ -91,30 +114,24 @@ class TestScopeAndBounds:
     def test_profile_scope_is_isolated(self, monkeypatch, tmp_path):
         from hermes_constants import get_hermes_home
 
+        original = get_hermes_home()
+        active_home = [original]
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: active_home[0])
         handle = code_registry.mint("313131")["code_handle"]
         other = tmp_path / "other-home"
         other.mkdir()
-        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: other)
+        active_home[0] = other
         # different scope → handle invisible
         assert code_registry.consume(handle) is None
-        monkeypatch.undo()
-        # back on original scope → still there (consume once)
-        # After monkeypatch.undo, scope is the test HERMES_HOME again.
-        # The mint above was on that scope, and the failed consume above did not drop it.
-        # But wait - consume under other scope looks up other's bucket only, so handle remains.
-        assert get_hermes_home() is not None
-        # Re-mint on restored scope for a deterministic assert:
-        h2 = code_registry.mint("414141")["code_handle"]
-        assert code_registry.consume(h2) == "414141"
+        active_home[0] = original
+        # Back on A, the original handle is still present.
+        assert code_registry.consume(handle) == "313131"
 
     def test_bounded_lru_evicts_oldest(self):
         handles = [
             code_registry.mint(f"{i:06d}", ttl_s=300)["code_handle"]
             for i in range(code_registry.MAX_PER_PROFILE + 4)
         ]
-        with code_registry._LOCK:
-            bucket = code_registry._REGISTRY[code_registry._scope()]
-            assert len(bucket) == code_registry.MAX_PER_PROFILE
         # oldest gone, newest present
         assert code_registry.consume(handles[0]) is None
         assert code_registry.consume(handles[-1]) == f"{code_registry.MAX_PER_PROFILE + 3:06d}"

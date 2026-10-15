@@ -17,6 +17,7 @@ import json
 import re
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -871,13 +872,40 @@ class TestTwoFactor:
 class TestCodeHandleHandoff:
     """#119683 — model-blind SMS/email code handle → browser_vault_enter_code."""
 
-    def test_code_handle_fills_without_prompt_and_code_stays_hidden(self):
+    def test_code_handle_fills_without_prompt_and_code_stays_hidden(self, tmp_path):
         from agent import code_registry
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool
 
-        code_registry.clear_codes()
-        minted = code_registry.mint("246810", source="sms", origin="https://acme.test")
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        env = dict(os.environ, HERMES_HOME=str(profile_home))
+        minted_proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "codes",
+                "put",
+                "-",
+                "--source",
+                "sms",
+                "--origin",
+                "https://acme.test",
+            ],
+            input="246810\n",
+            text=True,
+            capture_output=True,
+            check=True,
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+        )
+        minted = json.loads(minted_proc.stdout)
+        assert "246810" not in minted_proc.stdout
+        assert "246810" not in minted_proc.stderr
+        encrypted = profile_home / "cache" / "code-handles" / "handles.json.enc"
+        assert encrypted.is_file()
+        assert b"246810" not in encrypted.read_bytes()
         asked = []
         unlock_mod.set_code_prompt_callback(lambda site, hint: asked.append(site) or "999999")
         boxes = [{"index": i, "type": "tel", "name": f"digit{i}", "label": "",
@@ -894,7 +922,8 @@ class TestCodeHandleHandoff:
             return {"success": True, "result": json.dumps({"filled": 6})}
 
         try:
-            with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+            with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}), \
+                 patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
                  patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
                  patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
                  patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
