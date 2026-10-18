@@ -125,8 +125,13 @@ from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_lengt
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
 from agent.auxiliary_health import (
-    _custom_health_base_url, _unhealthy_cache_key, fallback_candidate_quarantine_ttl,
-    fallback_candidate_unavailable_reason,
+    _AUX_TIMEOUT_QUARANTINE_SECONDS, _custom_health_base_url, _unhealthy_cache_key,
+    auxiliary_timeout_breaker_blocks, begin_auxiliary_timeout_call, begin_auxiliary_timeout_walk,
+    clear_auxiliary_timeout_streak, end_auxiliary_timeout_call, end_auxiliary_timeout_walk,
+    exclude_auxiliary_timeout_for_walk, fallback_candidate_quarantine_ttl, fallback_candidate_unavailable_reason,
+    is_full_budget_timeout, note_auxiliary_timeout,
+    quarantined_primary_fallback, reset_auxiliary_timeout_streaks, timed_auxiliary_async_callback,
+    timed_auxiliary_callback,
 )
 from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
@@ -2640,7 +2645,8 @@ def _relay_sync_completion(
     relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
     task = relay_context.get("task")
     relay_context["stream_provider"] = provider or relay_context.get("provider")
-    callback = create or (lambda request: _create_with_progress(client, request, task))
+    callback = timed_auxiliary_callback(
+        create or (lambda request: _create_with_progress(client, request, task)), kwargs.get("timeout"), time.monotonic)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Isolate only the provider callback so the owning thread can unwind its lease/DB
     # transaction on hard cancel without touching the shared client.
@@ -2673,7 +2679,8 @@ async def _relay_async_completion(
 
     kwargs = prepare_chat_messages(client, kwargs)
     # Async twin of the seam default above (#98466).
-    callback = create or (lambda request: _acreate_with_progress(client, request))
+    callback = timed_auxiliary_async_callback(
+        create or (lambda request: _acreate_with_progress(client, request)), kwargs.get("timeout"), time.monotonic)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -3198,14 +3205,14 @@ def _is_provider_unhealthy(label: str, base_url: Optional[str] = None) -> bool:
         return False
     key = _unhealthy_cache_key(label, base_url)
     expires_at = _aux_unhealthy_until.get(key)
-    if expires_at is None:
-        return False
-    if time.time() >= expires_at:
+    now = time.time()
+    if expires_at is not None and now < expires_at:
+        return True
+    if expires_at is not None:
         _aux_unhealthy_until.pop(key, None)
         _aux_unhealthy_logged_at.pop(key, None)
         _aux_unhealthy_reason.pop(key, None)
-        return False
-    return True
+    return auxiliary_timeout_breaker_blocks(label, base_url, now=now)
 
 
 def _log_skip_unhealthy(
@@ -3229,6 +3236,7 @@ def _reset_aux_unhealthy_cache() -> None:
     _aux_unhealthy_until.clear()
     _aux_unhealthy_logged_at.clear()
     _aux_unhealthy_reason.clear()
+    reset_auxiliary_timeout_streaks()
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -4081,12 +4089,21 @@ def _quarantine_fallback_candidate(
     task: Optional[str], fb_label: str, fb_provider: str, fb_err: Exception, *,
     base_url: str = "", tag: str = "", reason: Optional[str] = None,
 ) -> None:
-    """The candidate cannot serve this walk (``reason`` = its ``_FALLBACK_REASONS`` capacity label,
-    None = dead token): mark it unhealthy so the ordered re-walk skips it and the caller moves on to
-    the next entry. Transient classes get a short hold, payment/quota and dead tokens the long one."""
-    _mark_provider_unhealthy(
-        fb_provider or fb_label, ttl=fallback_candidate_quarantine_ttl(reason),
-        base_url=base_url, reason=reason or "stale fallback credential")
+    """Skip an unavailable lane for this walk; persist only confirmed or non-timeout failures."""
+    provider = fb_provider or fb_label
+    timeout_failure = reason == "request timed out"
+    full_timeout = timeout_failure and is_full_budget_timeout(fb_err)
+    if timeout_failure:
+        if full_timeout and note_auxiliary_timeout(provider, base_url, now=time.time()):
+            _mark_provider_unhealthy(
+                provider, ttl=_AUX_TIMEOUT_QUARANTINE_SECONDS, base_url=base_url,
+                reason="consecutive request timeouts")
+        else:
+            exclude_auxiliary_timeout_for_walk(provider, base_url)
+    else:
+        _mark_provider_unhealthy(
+            provider, ttl=fallback_candidate_quarantine_ttl(reason),
+            base_url=base_url, reason=reason or "stale fallback credential")
     why = f"is out of capacity ({reason})" if reason else "has a stale/unrefreshable credential"
     logger.warning("Auxiliary %s%s: fallback candidate %s %s (%s) — skipping to next fallback",
                    task or "call", tag, fb_label, why, fb_err)
@@ -4118,15 +4135,10 @@ def _call_fallback_candidate_sync(
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
 ) -> Optional[Any]:
-    """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
-    credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
-    provider and return None so the caller moves on. A capacity error (quota/rate-limit 429, 402,
-    connection, route-incompatible model, malformed response) also quarantines and returns None so
-    the ordered chain advances to the next configured entry (#106367); other errors raise.
+    """Call one fallback lane with auth recovery and capacity-aware continuation (#106367).
 
-    ``effective_timeout`` is the task-level deadline; a configured-chain candidate with its own ``timeout``
-    entry gets that instead, so a fallback tuned differently from the primary is allowed its own budget
-    (#62452).
+    A configured entry's timeout overrides the task deadline so independently tuned fallbacks get
+    their own budget (#62452); unhandled errors still propagate.
     """
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
@@ -4136,7 +4148,7 @@ def _call_fallback_candidate_sync(
     )
 
     def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
-        return _validate_llm_response(
+        response = _validate_llm_response(
             _relay_sync_completion(
                 client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
                 create=lambda request: _create_with_progress(
@@ -4146,6 +4158,8 @@ def _call_fallback_candidate_sync(
             ),
             task,
         )
+        clear_auxiliary_timeout_streak(dest.provider, dest.base_url)
+        return response
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs
 
     def _send_recovering(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
@@ -4193,11 +4207,13 @@ async def _call_fallback_candidate_async(
 
     async def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
         import asyncio
-        return await asyncio.to_thread(
+        response = await asyncio.to_thread(
             _validate_llm_response,
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
             task,
         )
+        clear_auxiliary_timeout_streak(dest.provider, dest.base_url)
+        return response
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs_async
 
     async def _send_recovering(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
@@ -7393,6 +7409,10 @@ def _resolve_call_client(
 ) -> _ResolvedAuxRoute:
     """Resolve the client for one aux call: vision chain, or cached text client with the
     explicit-provider fallback_chain / auto-chain rescue; RuntimeError when nothing is configured."""
+    quarantined = quarantined_primary_fallback(
+        task, resolved_provider, resolved_base_url or base_url, async_mode=async_mode)
+    if quarantined is not None:
+        return _ResolvedAuxRoute(*quarantined)
     effective_provider = resolved_provider
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -7829,19 +7849,12 @@ def _next_fallback_after_quarantine(
 
 
 def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
-    """Last rung: other providers (per-task chain; then auto: main fallback chain + discovery
-    chain, explicit: main-agent-model net). Returns the response or None.
-    Capacity errors (payment/quota, connection, exhausted 429, model incompatible, malformed
-    response) bypass the explicit-provider gate — the provider cannot serve this request
-    regardless of user intent. Auth errors from an explicit provider may only use the task's
-    own configured fallback_chain; they never imply an unconfigured provider hop."""
+    """Try eligible task/provider fallbacks after earlier recovery rungs fail.
+
+    Capacity errors can leave an explicit route; auth errors can use only its configured chain."""
     task, tag, resolved_provider = route.task, route.tag, route.resolved_provider
-    # Respect explicit provider choice for transient errors (auth, request validation, etc.) but allow
-    # fallback when the provider clearly cannot serve the request due to capacity: payment/quota exhaustion
-    # and connection failures are capacity problems, not request constraints. See #26803: daily token quota
-    # (429 + "too many tokens per day") must fall back just like a 402 credit error.
-    # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity. See
-    # #52228. See #26803: daily token quota must fall back like a 402 credit error.
+    # Exhausted capacity may leave an explicit route; ordinary transient/request errors may not
+    # (#26803, #52228).
     is_auto = resolved_provider in {"auto", "", None}
     reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
     is_capacity_error = any(
@@ -7859,9 +7872,17 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         _mark_provider_unhealthy(
             _recoverable_pool_provider(resolved_provider, route.client, main_runtime=route.main_runtime)
             or resolved_provider, base_url=route.base_info)
+    full_timeout = reason == "request timed out" and is_full_budget_timeout(first_err)
     if reason == "request timed out":
-        # WARNING, naming the endpoint, the budget and the knob: the only other trace of a slow
-        # local model is the fallback provider's complaint about a model it never had (#89445).
+        health_provider = _effective_provider_for_client(route.client, resolved_provider)
+        if full_timeout:
+            if note_auxiliary_timeout(health_provider, route.base_info, now=time.time()):
+                _mark_provider_unhealthy(
+                    health_provider, ttl=_AUX_TIMEOUT_QUARANTINE_SECONDS,
+                    base_url=route.base_info, reason="consecutive request timeouts")
+            else:
+                exclude_auxiliary_timeout_for_walk(health_provider, route.base_info)
+        # Name the endpoint, budget and knob; otherwise only the fallback's misleading error is visible (#89445).
         stalled = "Auxiliary chat stream" in str(first_err)
         logger.warning("Auxiliary %s%s: request to %s %s (raise auxiliary.%s.%s for slow or reasoning "
                        "models) on %s, trying fallback", task or "call", tag, route.base_info or resolved_provider,
@@ -7870,14 +7891,13 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     else:
         logger.info("Auxiliary %s%s: %s on %s (%s), trying fallback",
                     task or "call", tag, reason, resolved_provider, first_err)
-    # Skip only the failed model for model-specific failures; 401/402 are provider-wide, so
-    # auth keeps skipping the credential surface, while billing is scoped to the endpoint:
-    # separate custom URLs can carry separate credentials (or no billing relationship at all).
+    # Model failures are model-scoped; auth is provider-wide; billing/full timeouts are endpoint-scoped.
     _chain_failed_model = None if reason in ("auth error", "payment error") else route.final_model
     from agent.backend_identity import FailureScope
     _chain_failure_scope = (
         FailureScope.ENDPOINT
-        if reason == "payment error" and _custom_health_base_url(resolved_provider, route.base_info)
+        if (reason == "payment error" or full_timeout)
+        and _custom_health_base_url(resolved_provider, route.base_info)
         else None
     )
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
@@ -7950,16 +7970,15 @@ def _aux_recovery_ladder(
     resp, first_err = yield from _ladder_credential_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp
-    resp = yield from _ladder_provider_fallback(first_err, route)
+    walk_token = begin_auxiliary_timeout_walk()
+    try:
+        resp = yield from _ladder_provider_fallback(first_err, route)
+    finally:
+        end_auxiliary_timeout_walk(walk_token)
     if resp is not None:
         return resp
-    # Connection/timeout errors poison the cached client (closed transport, half-read
-    # stream); evict so the next aux call rebuilds a fresh one.
-    # Reached only when no fallback answered, so the next auxiliary call rebuilds a fresh
-    # client instead of reusing the dead one. ``first_err`` is the narrowed error from the
-    # rungs above, not necessarily the original one. See issue #23432.
-    # Mirror the sync path: drop poisoned clients on connection/timeout so the next aux call rebuilds. See
-    # issue #23432.
+    # No fallback answered: evict a connection-poisoned client so the next call rebuilds (#23432).
+    # ``first_err`` is the ladder's narrowed error, not necessarily the original.
     if _is_connection_error(first_err):
         try:
             _evict_cached_client_instance(client)
@@ -8031,6 +8050,7 @@ def call_llm(
     if latency_info is not None:
         latency_info["queue_wait_ms"] = _elapsed_ms(queue_started_at, request_started_at)
     prior_progress_hook = getattr(_aux_progress, "hook", None)
+    timeout_tokens = begin_auxiliary_timeout_call(bypass=stream)
     try:
         with (
             scoped_runtime_main(main_runtime),
@@ -8057,6 +8077,7 @@ def call_llm(
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
     finally:
+        end_auxiliary_timeout_call(timeout_tokens)
         if latency_info is not None:
             latency_info["summary_generation_ms"] = _elapsed_ms(request_started_at)
         if semaphore is not None:
@@ -8156,11 +8177,9 @@ def _call_llm_impl(
     extra_headers: Optional[dict[str, str]] = None, api_mode: str | None = None, stream: bool = False,
     stream_options: dict | None = None, route_info: Optional[dict[str, str]] = None,
 ) -> Any:
-    """Centralized synchronous LLM call: resolve provider/model, auth, kwargs, fallbacks.
-    task: aux task whose provider:model comes from config (ignored if provider set); api_mode
-    overrides task config; timeout=None reads auxiliary.{task}.timeout; extra_headers override
-    client defaults. stream=True returns the raw SDK stream (caller consumes/falls back)
-    instead of a validated response. RuntimeError if no provider is configured."""
+    """Resolve and call a synchronous auxiliary route, then run its recovery ladder.
+
+    ``stream=True`` returns the raw SDK stream without completion validation or fallback."""
     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
         task, async_mode=False, provider=provider, model=model, base_url=base_url,
         api_key=api_key, main_runtime=main_runtime, messages=messages,
@@ -8169,8 +8188,7 @@ def _call_llm_impl(
         extra_headers=extra_headers, api_mode=api_mode, route_info=route_info,
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
-    # Streaming path (MoA aggregator): return the raw SDK stream, skipping validation and
-    # the fallback chain (they assume a complete response); the caller owns reassembly/fallback.
+    # Raw streaming skips completion validation/fallback; the caller owns reassembly.
     if stream:
         kwargs["stream"] = True
         if stream_options:
@@ -8182,18 +8200,9 @@ def _call_llm_impl(
         return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
 
     def _primary(**validate_kw: Any) -> Any:
-        # Retry on the same provider for a transient transport blip (connection reset / streaming-close /
-        # incomplete chunked read / 5xx / 408) before the except-chain below escalates to provider/model
-        # fallback. A dropped connection shouldn't abandon an otherwise-healthy provider — this especially
-        # matters for pinned auxiliary calls like MoA reference advisors, where "fallback to another
-        # provider" is not a meaningful recovery (the advisor is a specific model), so a transient blip that
-        # isn't retried simply loses that advisor for the turn (root of the run2 double-advisor "Connection
-        # error" collapse — a genuine upstream blip hitting both parallel advisors at once). Attempts are
-        # bounded and use exponential backoff. Count is configurable via auxiliary.transient_retries
-        # (default 2 retries → 3 total attempts); a second/third failure or any non-transient error falls
-        # through to ``first_err`` and the existing fallback handling unchanged. Unified home for the
-        # transient retry every auxiliary task shares. (PR #16587)
-        return _validate_llm_response(
+        # Bounded same-provider retries preserve pinned advisors across transport blips; exhausted
+        # retries fall through to the shared provider/model ladder unchanged (PR #16587).
+        response = _validate_llm_response(
             _relay_sync_completion(
                 client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
                 create=lambda request: _create_with_progress(
@@ -8204,10 +8213,10 @@ def _call_llm_impl(
             ),
             task, **validate_kw,
         )
+        clear_auxiliary_timeout_streak(request_provider, req.base_info)
+        return response
     try:
-        # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
-        # transient blips before escalating to fallback — a dropped connection shouldn't
-        # abandon a healthy provider (matters for pinned MoA advisors).
+        # Bounded same-provider retries handle transport blips before fallback.
         try:
             return _primary(provider=request_provider, base_url=req.base_info)
         except Exception as transient_err:
@@ -8231,20 +8240,19 @@ def _call_llm_impl(
     except Exception as first_err:
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
-            if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
-            if kind == "retry":
-                return _retry_same_provider_sync(**kw)
-            return _call_fallback_candidate_sync(*args, **kw)
+            if kind == "fallback":
+                return _call_fallback_candidate_sync(*args, **kw)
+            response = (_validate_llm_response(_relay_sync_completion(*args, **kw), task)
+                        if kind == "call" else _retry_same_provider_sync(**kw))
+            clear_auxiliary_timeout_streak(request_provider, req.base_info)
+            return response
         return _drive_ladder(
             _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
             _perform)
 
 
 def _coerce_llm_message(response):
-    """Pull a message (dict, object, or str) out of a response-or-message value: dict-shaped
-    responses/bare messages (compression, proxies) and ChatCompletion objects; MagicMock
-    ``reasoning_*`` attrs are deliberately not strings."""
+    """Pull a message from dict/object/string response shapes; ignore mock reasoning attrs."""
     if response is None or isinstance(response, str):
         return response
     if isinstance(response, dict):
@@ -8321,6 +8329,7 @@ async def async_call_llm(
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
+    timeout_tokens = begin_auxiliary_timeout_call()
     try:
         with scoped_runtime_main(main_runtime):
             return await _async_call_llm_impl(
@@ -8330,6 +8339,7 @@ async def async_call_llm(
                 reasoning_config=reasoning_config, route_info=route_info,
             )
     finally:
+        end_auxiliary_timeout_call(timeout_tokens)
         if semaphore is not None:
             semaphore.release()
 
@@ -8341,8 +8351,7 @@ async def _async_call_llm_impl(
     timeout: float | None = None, extra_body: dict | None = None, reasoning_config: Optional[dict] = None,
     route_info: Optional[dict[str, str]] = None,
 ) -> Any:
-    """Centralized asynchronous LLM call; see call_llm() for full documentation.
-    No per-request header / api_mode override on the async entry point."""
+    """Asynchronous auxiliary call with the same completion recovery ladder."""
     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
         task, async_mode=True, provider=provider, model=model, base_url=base_url,
         api_key=api_key, main_runtime=main_runtime, messages=messages,
@@ -8352,8 +8361,7 @@ async def _async_call_llm_impl(
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
     try:
-        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()).
-        # (PR #16587)
+        # Retry once on the same provider for a transient blip before fallback (#16587).
         _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
 
         async def _acreate(_kwargs: dict[str, Any]) -> Any:
@@ -8361,12 +8369,14 @@ async def _async_call_llm_impl(
 
         async def _primary(**validate_kw: Any) -> Any:
             import asyncio
-            return await asyncio.to_thread(
+            response = await asyncio.to_thread(
                 _validate_llm_response,
                 await _relay_async_completion(
                     client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
                     create=_acreate),
                 task, **validate_kw)
+            clear_auxiliary_timeout_streak(request_provider, req.base_info)
+            return response
         try:
             return await _primary(provider=request_provider, base_url=req.base_info)
         except Exception as transient_err:
@@ -8379,14 +8389,18 @@ async def _async_call_llm_impl(
     except Exception as first_err:
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
+            if kind == "fallback":
+                fb_client, fb_model, fb_label = args
+                fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
+                return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
             if kind == "call":
                 import asyncio
-                return await asyncio.to_thread(_validate_llm_response, await _relay_async_completion(*args, **kw), task)
-            if kind == "retry":
-                return await _retry_same_provider_async(**kw)
-            fb_client, fb_model, fb_label = args
-            fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
-            return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
+                response = await asyncio.to_thread(
+                    _validate_llm_response, await _relay_async_completion(*args, **kw), task)
+            else:
+                response = await _retry_same_provider_async(**kw)
+            clear_auxiliary_timeout_streak(request_provider, req.base_info)
+            return response
         return await _drive_ladder_async(
             _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=True, route_info=route_info),
             _perform)

@@ -137,3 +137,62 @@ def test_candidate_quarantine_ttl_is_short_for_transient_429_and_long_for_paymen
     assert _quarantine_remaining("http://127.0.0.1:3/v1") > 60
     marks = [r.getMessage() for r in caplog.records if "marking local/custom unhealthy" in r.getMessage()]
     assert marks and "payment" not in marks[0] and "rate limit" in marks[0]
+
+
+def test_fallback_candidate_requires_two_consecutive_timeouts_before_quarantine(monkeypatch):
+    """A single ambiguous timeout skips the lane only for this walk; the second opens the breaker."""
+    monotonic = [0.0]
+    monkeypatch.setattr(ac.time, "monotonic", lambda: monotonic[0])
+    primary = _client("http://127.0.0.1:1/v1", MagicMock(side_effect=_plain_429("A")))
+    lane_b_url = "http://127.0.0.1:2/v1"
+    outcomes = ["timeout", _ok_response("RECOVERED"), "timeout", "timeout"]
+
+    def lane_b_call(**kwargs):
+        outcome = outcomes.pop(0)
+        if outcome == "timeout":
+            monotonic[0] += float(kwargs["timeout"])
+            raise TimeoutError("Request timed out.")
+        return outcome
+
+    lane_b = _client(lane_b_url, MagicMock(side_effect=lane_b_call))
+    lane_c = _client("http://127.0.0.1:3/v1", MagicMock(return_value=_ok_response("OK")))
+    entries = [
+        {"provider": "custom", "model": "modelB", "base_url": lane_b_url},
+        {"provider": "custom", "model": "modelC", "base_url": lane_c.base_url},
+    ]
+
+    def resolve_entry(entry):
+        return (lane_b, "modelB") if entry is entries[0] else (lane_c, "modelC")
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "primary", primary.base_url, "local", None),
+        ),
+        patch("agent.auxiliary_client._get_cached_client", return_value=(primary, "primary")),
+        patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": entries},
+        ),
+        patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=resolve_entry),
+        patch("agent.auxiliary_client._try_main_agent_model_fallback", return_value=(None, None, "")),
+    ):
+        result = call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+        assert result.choices[0].message.content == "OK"
+        assert not ac._is_provider_unhealthy("custom", lane_b_url)
+
+        # A success from the same fallback endpoint clears its one-timeout streak.
+        result = call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+        assert result.choices[0].message.content == "RECOVERED"
+        assert not ac._is_provider_unhealthy("custom", lane_b_url)
+
+        result = call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+        assert result.choices[0].message.content == "OK"
+        assert not ac._is_provider_unhealthy("custom", lane_b_url)
+
+        result = call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+        assert result.choices[0].message.content == "OK"
+        assert ac._is_provider_unhealthy("custom", lane_b_url)
+
+    assert lane_b.chat.completions.create.call_count == 4
+    assert lane_c.chat.completions.create.call_count == 3
