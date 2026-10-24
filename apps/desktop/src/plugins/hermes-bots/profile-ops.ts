@@ -94,7 +94,11 @@ function pushLocalAvatars(roster: RosterRow[]) {
     // Vector shape/color face: no image exists anywhere — rasterize the
     // live SVG (tagged data-bot-face) to a PNG and push that, so the
     // inter-agent notices (core #85855/#85888) can show the real pfp.
-    const svg = document.querySelector('svg[data-bot-face=' + JSON.stringify(bot.name) + ']')
+    // Attribute selectors match the PARSED value; escape the two characters
+    // that matter inside a double-quoted CSS string so a `"` in the name
+    // can't terminate the selector early (JSON.stringify is not CSS escaping).
+    const faceAttr = bot.name.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+    const svg = document.querySelector(`svg[data-bot-face="${faceAttr}"]`)
 
     if (!svg) {
       continue

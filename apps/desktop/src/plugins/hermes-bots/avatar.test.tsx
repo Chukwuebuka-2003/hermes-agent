@@ -120,6 +120,21 @@ describe('rendering a blob face', () => {
     expect('traits' in opts).toBe(false)
   })
 
+  it('cannot smuggle attributes in through the name (hostile names round-trip as the attribute VALUE)', async () => {
+    // data-bot-face is interpolated into markup inserted via
+    // dangerouslySetInnerHTML. HTML attribute parsing has no backslash
+    // escapes, so a `"` in the name must not close the attribute (or an
+    // `onload=…` tail would become a live attribute); `&` must survive as a
+    // literal so the value the PNG backfill queries by stays the raw name.
+    const { BotFace } = await import('./avatar')
+    const hostile = 'evil" onload=alert(1) &lt;img&gt;'
+
+    const { container } = render(<BotFace color="#38bdf8" name={hostile} shape="blobatar" size={32} />)
+
+    expect(container.querySelector('svg[onload]')).toBeNull()
+    expect(container.querySelector('svg')?.getAttribute('data-bot-face')).toBe(hostile)
+  })
+
   it('puts every silhouette inside its own frozen band', async () => {
     const { BLOB_KINDS, BotFace } = await import('./avatar')
 
